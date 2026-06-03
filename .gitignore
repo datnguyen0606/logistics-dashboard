@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+.pytest_cache/
+
+# Node / Frontend
+node_modules/
+dist/
+build/
+.next/
+
+# Environment
+.env
+.env.local
+.env.*.local
+*.env
+
+# Secrets
+*.key
+*.pem
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Coverage
+coverage/
+htmlcov/
+.coverage
+
+specs/
+*.md
+.claude/
+.specify/
