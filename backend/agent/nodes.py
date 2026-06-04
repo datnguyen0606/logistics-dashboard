@@ -5,7 +5,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.agent.state import AgentState
 from backend.agent.tools import TOOL_SCHEMAS
 from backend.schemas.query import AnalyticsToolParams, ForecastToolParams
-from backend.schemas.dashboard import DashboardFilters
 from backend.config import settings
 
 _client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
@@ -24,26 +23,22 @@ delivery_days (integer, computed), is_delayed (boolean, computed).
 """
 
 _INTERPRET_SYSTEM = f"""
-You are a logistics data analyst assistant. Your job is to interpret user questions
-about logistics operations and produce structured parameters for data retrieval.
+You are a logistics data analyst assistant. Classify the user's question and pass it through.
 
 {_SCHEMA_DESCRIPTION}
 
-Available tools:
-{json.dumps(TOOL_SCHEMAS, indent=2)}
+Intents:
+- analytics_query: questions about current or historical logistics metrics, patterns, or breakdowns
+- forecast: questions asking to predict, forecast, or project future values
+- clarify: questions unrelated to logistics data or too ambiguous to answer
 
-You MUST NEVER answer data questions from memory.
-Always produce tool_params for computation.
-
-Respond with a JSON object only — no prose. Format:
+Respond with JSON only — no prose:
 {{
-  "intent": "analytics_query" | "forecast" | "clarify",
-  "tool_params": {{ ... }},
-  "chart_hint": "bar" | "line" | "pie" | "table"
+  "intent": "analytics_query | forecast | clarify",
+  "tool_params": {{"question": "<the user's question verbatim>"}}
 }}
 
-If the question is ambiguous or unrelated to logistics data, set intent to "clarify"
-and leave tool_params as null.
+If intent is "clarify", set tool_params to null.
 """
 
 _SUMMARIZE_SYSTEM = """
@@ -91,44 +86,76 @@ async def route_node(state: AgentState) -> dict:
 
 
 async def execute_query_node(state: AgentState, db: AsyncSession) -> dict:
-    from backend.services.analytics_service import run_chart
+    from backend.services.analytics_service import run_query_open
 
     trace = list(state.get("node_trace", []))
     trace.append("execute_query")
 
     params = AnalyticsToolParams(**(state["tool_params"] or {}))
-    filters = DashboardFilters(**(params.filters or {}))
-    data = await run_chart(db, params.metric, params.group_by, filters)
+    result = await run_query_open(db, params.question)
+
+    chart_spec = {
+        "type":   result["chart_type"],
+        "title":  result["title"],
+        "x_key":  "label",
+        "y_keys": ["value"],
+        "data":   result["data"],
+    }
 
     explainability = {
         "intent":    state.get("intent"),
         "tool_used": "query_tool",
-        "filters":   params.filters,
-        "metric":    params.metric,
-        "group_by":  params.group_by,
+        "filters":   {"question": params.question},
+        "metric":    result["metric"],
+        "group_by":  result["group_by"],
         "node_trace": trace + ["summarize"],
     }
-    return {"tool_result": data, "explainability": explainability, "node_trace": trace}
+    return {
+        "tool_result":    result["data"],
+        "chart_spec":     chart_spec,
+        "explainability": explainability,
+        "node_trace":     trace,
+    }
 
 
 async def execute_forecast_node(state: AgentState, db: AsyncSession) -> dict:
-    from backend.services.forecast_service import forecast_demand
+    from backend.services.forecast_service import forecast_open
 
     trace = list(state.get("node_trace", []))
     trace.append("execute_forecast")
 
     params = ForecastToolParams(**(state["tool_params"] or {}))
-    result = await forecast_demand(db, params.target, params.target_type, params.periods, params.period_unit)
+    result = await forecast_open(db, params.question)
+
+    chart_data = [{"period": p.period, "historical": p.quantity} for p in result.historical]
+    for proj in result.forecast:
+        chart_data.append({
+            "period":   proj.period,
+            "forecast": proj.quantity,
+            "ci_band":  round(proj.upper - proj.lower, 1),
+        })
+    chart_spec = {
+        "type":   "forecast",
+        "title":  result.title,
+        "x_key":  "period",
+        "y_keys": ["historical", "forecast"],
+        "data":   chart_data,
+    }
 
     explainability = {
         "intent":    state.get("intent"),
         "tool_used": "forecast_tool",
-        "filters":   {"target": params.target, "target_type": params.target_type},
-        "metric":    "quantity",
-        "group_by":  params.period_unit,
+        "filters":   {"question": params.question},
+        "metric":    "forecast",
+        "group_by":  "period",
         "node_trace": trace + ["summarize"],
     }
-    return {"tool_result": result.model_dump(), "explainability": explainability, "node_trace": trace}
+    return {
+        "tool_result":    result.model_dump(),
+        "chart_spec":     chart_spec,
+        "explainability": explainability,
+        "node_trace":     trace,
+    }
 
 
 async def summarize_node(state: AgentState) -> dict:
@@ -169,9 +196,13 @@ async def summarize_node(state: AgentState) -> dict:
     explainability = dict(state.get("explainability") or {})
     explainability["node_trace"] = trace
 
+    # Prefer a chart_spec already built by an execute node (e.g. forecast);
+    # fall back to Claude's generated spec for analytics queries.
+    chart_spec = state.get("chart_spec") or parsed.get("chart_spec")
+
     return {
         "answer":        parsed.get("answer", ""),
-        "chart_spec":    parsed.get("chart_spec"),
+        "chart_spec":    chart_spec,
         "explainability": explainability,
         "node_trace":    trace,
     }

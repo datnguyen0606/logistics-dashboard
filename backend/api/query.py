@@ -48,7 +48,11 @@ async def _stream_agent(question: str, db: AsyncSession):
             "answer":          final_state.get("answer", ""),
             "chart":           final_state.get("chart_spec"),
             "explainability":  final_state.get("explainability"),
-            "underlying_data": final_state.get("tool_result") if isinstance(final_state.get("tool_result"), list) else [],
+            "underlying_data": (
+                final_state.get("tool_result")
+                if isinstance(final_state.get("tool_result"), list)
+                else final_state.get("chart_spec", {}).get("data", [])
+            ),
         }
         yield f"data: {json.dumps(complete, default=str)}\n\n"
 

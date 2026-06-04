@@ -1,125 +1,217 @@
+import json
 import math
 from typing import Literal
-import numpy as np
+
+import anthropic
 import pandas as pd
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from fastapi import HTTPException
 
+from backend.config import settings
 from backend.schemas.forecast import ForecastResponse, ForecastPeriod, ForecastProjection
 
-_HISTORICAL_SQL = """
-    SELECT
-        {trunc_expr} AS period,
-        SUM(quantity)::float AS quantity
-    FROM orders
-    WHERE {filter_col} = :target
-    GROUP BY {trunc_expr}
-    ORDER BY 1
+_client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+_MODEL  = "claude-sonnet-4-20250514"
+
+# Allowlists — Claude's extracted params are validated before any SQL runs
+_ALLOWED_METRICS = {
+    "order_count", "delay_rate", "order_value", "avg_delivery_days", "quantity",
+}
+_ALLOWED_FILTER_COLS = {"carrier", "region", "product_category", "sku"}
+_ALLOWED_PERIOD_UNITS = {"week", "month"}
+
+_TIME_SERIES_SQL: dict[str, str] = {
+    "order_count": """
+        SELECT {trunc} AS period, COUNT(*)::float AS value
+        FROM orders WHERE {where} GROUP BY {trunc} ORDER BY 1
+    """,
+    "delay_rate": """
+        SELECT {trunc} AS period,
+               ROUND(100.0 * SUM(is_delayed::int) / NULLIF(COUNT(*), 0), 1)::float AS value
+        FROM orders WHERE {where} GROUP BY {trunc} ORDER BY 1
+    """,
+    "order_value": """
+        SELECT {trunc} AS period, ROUND(SUM(order_value_usd)::numeric, 2)::float AS value
+        FROM orders WHERE {where} GROUP BY {trunc} ORDER BY 1
+    """,
+    "avg_delivery_days": """
+        SELECT {trunc} AS period,
+               ROUND(AVG(delivery_days)::numeric, 1)::float AS value
+        FROM orders WHERE {where} AND delivery_days IS NOT NULL GROUP BY {trunc} ORDER BY 1
+    """,
+    "quantity": """
+        SELECT {trunc} AS period, SUM(quantity)::float AS value
+        FROM orders WHERE {where} GROUP BY {trunc} ORDER BY 1
+    """,
+}
+
+_EXTRACT_SYSTEM = f"""
+You are a logistics data analyst. Given a forecast question, extract structured query parameters.
+
+Available dataset columns: order_date, carrier, region, product_category, sku,
+quantity, order_value_usd, delivery_days, is_delayed, status.
+
+Allowed metrics: {sorted(_ALLOWED_METRICS)}
+Allowed filter_col values: {sorted(_ALLOWED_FILTER_COLS)} (null = no filter, aggregate all)
+Allowed period_unit values: week, month
+
+Respond with JSON only — no prose, no markdown:
+{{
+  "metric":      "<metric>",
+  "filter_col":  "<column name or null>",
+  "filter_val":  "<value or null>",
+  "periods":     <integer 1-12>,
+  "period_unit": "week | month",
+  "title":       "<short descriptive chart title>"
+}}
+"""
+
+_FORECAST_SYSTEM = """
+You are a quantitative forecasting assistant. Given a historical time series and a question,
+forecast future periods.
+
+Respond with JSON only — no prose, no markdown fences:
+{
+  "forecast": [
+    {"period": "<label>", "value": <float>, "lower": <float>, "upper": <float>},
+    ...
+  ],
+  "method":      "<one-line description of your forecasting approach>",
+  "explanation": "<2-3 sentences on observed trend and forecast rationale>"
+}
+
+Rules:
+- period labels must continue the same format as the input (YYYY-MM or YYYY-WNN)
+- lower/upper represent an approximate 90% confidence interval around value
+- for rate/percentage metrics keep values between 0 and 100
+- all values must be non-negative
+- return exactly the requested number of periods
 """
 
 
 def _trunc_expr(period_unit: str) -> str:
-    if period_unit == "month":
-        return "DATE_TRUNC('month', order_date)"
-    return "DATE_TRUNC('week', order_date)"
+    return "DATE_TRUNC('month', order_date)" if period_unit == "month" else "DATE_TRUNC('week', order_date)"
 
 
 def _period_label(ts, period_unit: str) -> str:
-    if period_unit == "month":
-        return pd.Timestamp(ts).strftime("%Y-%m")
-    return pd.Timestamp(ts).strftime("%Y-W%V")
+    return pd.Timestamp(ts).strftime("%Y-%m" if period_unit == "month" else "%Y-W%V")
 
 
-def _next_period_label(last_ts, step: int, period_unit: str) -> str:
-    ts = pd.Timestamp(last_ts)
-    if period_unit == "month":
-        month = ts.month + step
-        year  = ts.year + (month - 1) // 12
-        month = ((month - 1) % 12) + 1
-        return f"{year}-{month:02d}"
-    return (ts + pd.DateOffset(weeks=step)).strftime("%Y-W%V")
+async def _extract_params(question: str) -> dict:
+    response = await _client.messages.create(
+        model=_MODEL,
+        max_tokens=256,
+        system=_EXTRACT_SYSTEM,
+        messages=[{"role": "user", "content": question}],
+    )
+    parsed = json.loads(response.content[0].text.strip())
+
+    metric      = parsed.get("metric", "order_count")
+    filter_col  = parsed.get("filter_col")
+    period_unit = parsed.get("period_unit", "month")
+
+    # Validate all values against allowlists before building any SQL
+    if metric not in _ALLOWED_METRICS:
+        metric = "order_count"
+    if filter_col and filter_col not in _ALLOWED_FILTER_COLS:
+        filter_col = None
+    if period_unit not in _ALLOWED_PERIOD_UNITS:
+        period_unit = "month"
+
+    return {
+        "metric":      metric,
+        "filter_col":  filter_col,
+        "filter_val":  parsed.get("filter_val"),
+        "periods":     max(1, min(12, int(parsed.get("periods", 3)))),
+        "period_unit": period_unit,
+        "title":       parsed.get("title", "Forecast"),
+    }
 
 
-async def forecast_demand(
-    db: AsyncSession,
-    target: str,
-    target_type: Literal["sku", "category"],
-    periods: int,
-    period_unit: Literal["week", "month"],
-) -> ForecastResponse:
-    filter_col = "sku" if target_type == "sku" else "product_category"
-    trunc = _trunc_expr(period_unit)
-    sql = _HISTORICAL_SQL.format(trunc_expr=trunc, filter_col=filter_col)
+async def _fetch_series(db: AsyncSession, params: dict) -> list[ForecastPeriod]:
+    trunc = _trunc_expr(params["period_unit"])
+    where_clauses = ["order_date IS NOT NULL"]
+    bind_params: dict = {}
 
-    rows = (await db.execute(text(sql), {"target": target})).all()
+    if params["filter_col"] and params["filter_val"]:
+        where_clauses.append(f"{params['filter_col']} = :filter_val")
+        bind_params["filter_val"] = params["filter_val"]
+
+    where = " AND ".join(where_clauses)
+    sql = _TIME_SERIES_SQL[params["metric"]].format(trunc=trunc, where=where)
+
+    rows = (await db.execute(text(sql), bind_params)).all()
     if not rows:
-        raise HTTPException(status_code=404, detail=f"No data found for {target_type} '{target}'")
+        raise HTTPException(
+            status_code=404,
+            detail="No data found for the requested forecast. Check the filter values and try again.",
+        )
 
-    historical = [
-        ForecastPeriod(period=_period_label(r.period, period_unit), quantity=r.quantity)
+    return [
+        ForecastPeriod(period=_period_label(r.period, params["period_unit"]), quantity=float(r.value or 0))
         for r in rows
     ]
-    series = pd.Series([r.quantity for r in rows], dtype=float)
-    n = len(series)
 
-    if n >= 6:
-        from statsmodels.tsa.holtwinters import ExponentialSmoothing
-        model  = ExponentialSmoothing(series, trend="add", initialization_method="estimated").fit()
-        fc     = model.forecast(periods)
-        method = "exponential_smoothing"
 
-        # Approximate 95% CI from residual standard deviation
-        residuals = series.values - model.fittedvalues.values
-        sigma = math.sqrt(float(np.mean(residuals ** 2)))
-        margin = 1.96 * sigma
+async def _llm_forecast(
+    question: str,
+    historical: list[ForecastPeriod],
+    params: dict,
+) -> tuple[list[ForecastProjection], str, str]:
+    history_payload = [{"period": p.period, "value": p.quantity} for p in historical]
+    filter_note = (
+        f" for {params['filter_col']}={params['filter_val']}" if params.get("filter_val") else ""
+    )
+    user_message = (
+        f'Forecast question: "{question}"\n\n'
+        f"Historical {params['period_unit']}ly {params['metric']}{filter_note}:\n"
+        f"{json.dumps(history_payload, indent=2)}\n\n"
+        f"Produce {params['periods']} {params['period_unit']}(s) of forecast "
+        f"continuing from {historical[-1].period}."
+    )
 
-        explanation = (
-            f"Applied Holt-Winters additive trend. "
-            f"Alpha={model.params.get('smoothing_level', 'n/a'):.3f}. "
-            f"Confidence intervals: ±1.96 × residual std dev ({sigma:.1f} units). "
-            f"Dataset has {n} {'months' if period_unit == 'month' else 'weeks'} of history — "
-            f"no seasonal component fitted (insufficient history)."
-        )
-    else:
-        x      = np.arange(n)
-        coeffs = np.polyfit(x, series.values, 1)
-        fc_x   = np.arange(n, n + periods)
-        fc     = pd.Series(np.polyval(coeffs, fc_x))
-        method = "linear_regression_fallback"
+    response = await _client.messages.create(
+        model=_MODEL,
+        max_tokens=1024,
+        system=_FORECAST_SYSTEM,
+        messages=[{"role": "user", "content": user_message}],
+    )
 
-        slope = coeffs[0]
-        sigma = float(np.std(series.values - np.polyval(coeffs, x)))
-        margin = 1.96 * sigma
+    raw = response.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw[raw.index("\n") + 1 : raw.rfind("```")]
 
-        explanation = (
-            f"Insufficient history for exponential smoothing ({n} data points found). "
-            f"Applied linear regression fallback (slope: {slope:.1f} units/period). "
-            f"Forecast accuracy is limited. CI: ±1.96 × residual std dev ({sigma:.1f} units)."
-        )
+    parsed = json.loads(raw)
 
-    last_ts = rows[-1].period
-    forecast_out = [
+    projections = [
         ForecastProjection(
-            period=_next_period_label(last_ts, i + 1, period_unit),
-            quantity=round(float(fc.iloc[i]), 1),
-            lower=round(float(fc.iloc[i]) - margin, 1),
-            upper=round(float(fc.iloc[i]) + margin, 1),
+            period=p["period"],
+            quantity=max(0.0, round(float(p["value"]), 1)),
+            lower=max(0.0,    round(float(p["lower"]),  1)),
+            upper=max(0.0,    round(float(p["upper"]),  1)),
         )
-        for i in range(periods)
+        for p in parsed["forecast"][: params["periods"]]
     ]
+    return projections, parsed.get("method", "llm_forecast"), parsed.get("explanation", "")
 
-    final_qty = forecast_out[-1].quantity
+
+async def forecast_open(db: AsyncSession, question: str) -> ForecastResponse:
+    params      = await _extract_params(question)
+    historical  = await _fetch_series(db, params)
+    projections, method, explanation = await _llm_forecast(question, historical, params)
+
+    final_qty  = projections[-1].quantity
     safety_qty = math.ceil(final_qty * 1.15)
-    final_period = forecast_out[-1].period
     recommendation = (
-        f"Plan for ~{round(final_qty)} units in {final_period}. "
-        f"Apply 15% safety stock → order {safety_qty} units."
+        f"Plan for ~{round(final_qty)} {params['metric']} in {projections[-1].period}. "
+        f"Apply 15% safety buffer → target {safety_qty}."
     )
 
     return ForecastResponse(
+        title=params["title"],
         historical=historical,
-        forecast=forecast_out,
+        forecast=projections,
         method=method,
         recommendation=recommendation,
         explanation=explanation,

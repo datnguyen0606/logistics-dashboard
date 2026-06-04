@@ -1,12 +1,8 @@
-from typing import Literal
 from pydantic import BaseModel, Field
 
 
 class ForecastRequest(BaseModel):
-    target:      str
-    target_type: Literal["sku", "category"]
-    periods:     int = Field(default=3, ge=1, le=12)
-    period_unit: Literal["week", "month"] = "month"
+    question: str
 
 
 class ForecastPeriod(BaseModel):
@@ -22,6 +18,7 @@ class ForecastProjection(BaseModel):
 
 
 class ForecastResponse(BaseModel):
+    title:          str
     historical:     list[ForecastPeriod]
     forecast:       list[ForecastProjection]
     method:         str
