@@ -45,6 +45,7 @@ htmlcov/
 .coverage
 
 specs/
-*.md
+/*.md
+!README.md
 .claude/
 .specify/
