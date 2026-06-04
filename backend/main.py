@@ -11,10 +11,13 @@ from backend.api import dashboard, query, forecast
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Verify DB connectivity and validate Anthropic key on startup
-    async with engine.connect() as conn:
-        result = await conn.execute(text("SELECT COUNT(*) FROM orders"))
-        count = result.scalar()
-        print(f"[startup] orders table: {count} rows")
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(text("SELECT COUNT(*) FROM orders"))
+            count = result.scalar()
+            print(f"[startup] orders table: {count} rows")
+    except Exception as e:
+        print(f"[startup] WARNING: orders table not found — run 'python -m backend.db.loader' to seed the database ({e})")
 
     if not settings.ANTHROPIC_API_KEY or settings.ANTHROPIC_API_KEY.startswith("sk-ant-..."):
         print("[startup] WARNING: ANTHROPIC_API_KEY is not configured — AI query endpoint will fail")
